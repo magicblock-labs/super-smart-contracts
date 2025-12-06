@@ -238,7 +238,7 @@ async fn process_interaction(
                     .iter()
                     .map(|meta| AccountMeta {
                         pubkey: meta.pubkey,
-                        is_signer: meta.is_signer,
+                        is_signer: false,
                         is_writable: meta.is_writable,
                     })
                     .collect();
