@@ -1,21 +1,25 @@
 # Super Smart Contract
 
-Super Smart Contracts are Smart Contracts enhanced by AI. They can interact with users, learn from them, and adapt to their needs. This repository provides a simple example of a Super Smart Contract using OpenAI API to respond to queries.
+Super Smart Contracts are Smart Contracts enhanced by AI. They can interact with users, learn from them, and adapt to their needs. This repository provides a simple example of a Super Smart Contract using OpenRouter API to respond to queries.
 
 
 ## This repository provides:
 
-1. An oracle using OpenAI API to respond to queries
+1. An oracle using OpenRouter API to respond to queries
 2. A smart contract which serves as an interface to the oracle: LLMrieZMpbJFwN52WgmBNMxYojrpRVYXdC1RCweEbab
 3. Two example of agents definitions:
    - A [simple agent](./programs/simple-agent) which queries the oracle and logs the response
    - An [agent which can dispense tokens](./programs/agent-minter) if convinced by the user knowledge of Solana
 4. A [UI](./app) to interact with the agent minter
 
+The oracle requires `OPENROUTER_API_KEY`. Its model is configured with
+`OPENROUTER_MODEL` and defaults to `openrouter/free`, so deployments can use a
+free model on devnet and override the model with a more capable one on mainnet.
+
 
 # How to create a Super Smart Contract
 
-First, add the [solana-gpt-oracle](./programs/solana-gpt-oracle) as a dependency to your project. This program provides the interface to the OpenAI API.
+First, add the [solana-gpt-oracle](./programs/solana-gpt-oracle) as a dependency to your project. This program provides the interface to the OpenRouter API.
 
 ```bash
 cargo add solana-gpt-oracle

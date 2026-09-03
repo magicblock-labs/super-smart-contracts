@@ -27,19 +27,25 @@ mod memory;
 
 const MAX_TX_RETRY_ATTEMPTS: u8 = 5;
 const MAX_API_RETRY_ATTEMPTS: u8 = 3;
+const OPENROUTER_API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+const DEFAULT_OPENROUTER_MODEL: &str = "openrouter/free";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let (rpc_url, websocket_url, open_api_key, payer, identity_pda) = load_config();
+    let (rpc_url, websocket_url, openrouter_api_key, openrouter_model, payer, identity_pda) =
+        load_config();
+    let openrouter_model: &'static str = Box::leak(openrouter_model.into_boxed_str());
     let mut interaction_memory = InteractionMemory::new(10);
     println!(" Oracle identity: {:?}", payer.pubkey());
     println!(" RPC: {:?}", rpc_url.as_str());
     println!(" WS: {:?}", websocket_url.as_str());
+    println!(" OpenRouter model: {:?}", openrouter_model);
     loop {
         if let Err(e) = run_oracle(
             rpc_url.as_str(),
             websocket_url.as_str(),
-            open_api_key.as_str(),
+            openrouter_api_key.as_str(),
+            openrouter_model,
             &payer,
             &identity_pda,
             &mut interaction_memory,
@@ -54,15 +60,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 async fn run_oracle(
     rpc_url: &str,
     websocket_url: &str,
-    open_api_key: &str,
+    openrouter_api_key: &str,
+    openrouter_model: &'static str,
     payer: &Keypair,
     identity_pda: &Pubkey,
     interaction_memory: &mut InteractionMemory,
 ) -> Result<(), Box<dyn Error>> {
-    let open_ai_client = ChatGPT::new_with_config(
-        open_api_key,
+    let openrouter_client = ChatGPT::new_with_config(
+        openrouter_api_key,
         ModelConfiguration {
-            engine: chatgpt::config::ChatGPTEngine::Custom("gpt-4o"),
+            engine: chatgpt::config::ChatGPTEngine::Custom(openrouter_model),
+            api_url: OPENROUTER_API_URL.parse()?,
             presence_penalty: 0.3,
             frequency_penalty: 0.3,
             max_tokens: Some(100),
@@ -94,7 +102,7 @@ async fn run_oracle(
         filters.clone(),
         payer,
         identity_pda,
-        &open_ai_client,
+        &openrouter_client,
         interaction_memory,
     )
     .await?;
@@ -126,7 +134,7 @@ async fn run_oracle(
                 process_interaction(
                     payer,
                     identity_pda,
-                    &open_ai_client,
+                    &openrouter_client,
                     &rpc_client,
                     interaction_pubkey,
                     data,
@@ -144,7 +152,7 @@ async fn run_oracle(
 async fn process_interaction(
     payer: &Keypair,
     identity_pda: &Pubkey,
-    open_ai_client: &ChatGPT,
+    openrouter_client: &ChatGPT,
     rpc_client: &RpcClient,
     interaction_pubkey: Pubkey,
     data: Vec<u8>,
@@ -166,7 +174,7 @@ async fn process_interaction(
                     interaction, interaction_pubkey
                 );
 
-                // Get a response from the OpenAI API
+                // Get a response from the OpenRouter API
                 let mut previous_history = interaction_memory
                     .get_history(&interaction_pubkey)
                     .unwrap_or(Vec::new())
@@ -186,7 +194,7 @@ async fn process_interaction(
                 let mut api_attempts = 0;
                 let mut response_content = String::new();
                 while api_attempts < MAX_API_RETRY_ATTEMPTS {
-                    match open_ai_client.send_history(&previous_history).await {
+                    match openrouter_client.send_history(&previous_history).await {
                         Ok(response) => {
                             response_content = response.message().content.clone();
                             break;
@@ -290,7 +298,7 @@ async fn fetch_and_process_program_accounts(
     filters: Vec<solana_client::rpc_filter::RpcFilterType>,
     payer: &Keypair,
     identity_pda: &Pubkey,
-    open_ai_client: &ChatGPT,
+    openrouter_client: &ChatGPT,
     interaction_memory: &mut InteractionMemory,
 ) -> Result<(), Box<dyn Error>> {
     let rpc_config = RpcAccountInfoConfig {
@@ -312,7 +320,7 @@ async fn fetch_and_process_program_accounts(
         process_interaction(
             payer,
             identity_pda,
-            open_ai_client,
+            openrouter_client,
             rpc_client,
             pubkey,
             account.data,
@@ -325,15 +333,24 @@ async fn fetch_and_process_program_accounts(
 }
 
 /// Load the Oracle configuration
-fn load_config() -> (String, String, String, Keypair, Pubkey) {
+fn load_config() -> (String, String, String, String, Keypair, Pubkey) {
     let identity = env::var("IDENTITY").unwrap_or(
         "62LxqpAW6SWhp7iKBjCQneapn1w6btAhW7xHeREWSpPzw3xZbHCfAFesSR4R76ejQXCLWrndn37cKCCLFvx6Swps"
             .to_string(),
     );
     let rpc_url = env::var("RPC_URL").unwrap_or("http://localhost:8899".to_string());
     let websocket_url = env::var("WEBSOCKET_URL").unwrap_or("ws://localhost:8900".to_string());
-    let open_api_key = env::var("OPENAI_API_KEY").unwrap_or("OPENAI_API_KEY not set".to_string());
+    let openrouter_api_key = env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY not set");
+    let openrouter_model =
+        env::var("OPENROUTER_MODEL").unwrap_or(DEFAULT_OPENROUTER_MODEL.to_string());
     let payer = Keypair::from_base58_string(&identity);
     let identity_pda = Pubkey::find_program_address(&[b"identity"], &solana_gpt_oracle::ID).0;
-    (rpc_url, websocket_url, open_api_key, payer, identity_pda)
+    (
+        rpc_url,
+        websocket_url,
+        openrouter_api_key,
+        openrouter_model,
+        payer,
+        identity_pda,
+    )
 }
