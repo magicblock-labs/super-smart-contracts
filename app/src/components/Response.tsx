@@ -7,7 +7,7 @@ type ResponseProps = {
 };
 
 const Response: React.FC<ResponseProps> = ({ loading, message, onClose }) => {
-    //const [opacity, setOpacity] = useState(0);
+    const [opacity, setOpacity] = useState(1);
     const [loadingDots, setLoadingDots] = useState('.');
 
     // Handle loading animation
@@ -21,22 +21,26 @@ const Response: React.FC<ResponseProps> = ({ loading, message, onClose }) => {
     }, [message]);
 
     // Handle fade effect
-    // useEffect(() => {
-    //     setOpacity(1);
-    //
-    //     const fadeOutTimer = setTimeout(() => {
-    //         setOpacity(0);
-    //     }, 13000);
-    //
-    //     const removeTimer = setTimeout(() => {
-    //         onClose();
-    //     }, 14000);
-    //
-    //     return () => {
-    //         clearTimeout(fadeOutTimer);
-    //         clearTimeout(removeTimer);
-    //     };
-    // }, [onClose]);
+    useEffect(() => {
+        if (!message) {
+            setOpacity(1);
+            return;
+        }
+        setOpacity(1);
+
+        const fadeOutTimer = setTimeout(() => {
+            setOpacity(0);
+        }, 20000);
+
+        const removeTimer = setTimeout(() => {
+            onClose();
+        }, 21000);
+
+        return () => {
+            clearTimeout(fadeOutTimer);
+            clearTimeout(removeTimer);
+        };
+    }, [message, onClose]);
 
     return (
         <div style={{
@@ -45,7 +49,7 @@ const Response: React.FC<ResponseProps> = ({ loading, message, onClose }) => {
             borderRadius: '10px',
             color: 'white',
             transition: 'opacity 1s ease-in-out',
-            opacity: 1,
+            opacity: opacity,
             zIndex: 1000,
             justifyContent: 'center',
             alignItems: 'center',

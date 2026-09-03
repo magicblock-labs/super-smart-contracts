@@ -23,6 +23,7 @@ const App: React.FC = () => {
     const [agentReply, setAgentReply] = useState<[string, bigint, string] | null>(null);
     const [isClientInitialized, setIsClientInitialized] = useState<boolean>(false);
     const [inputText, setInputText] = useState<string>("");
+    const clearAgentReply = useCallback(() => setAgentReply(null), []);
 
     const agentProgramClient = useRef<Program | null>(null);
     const agentAddress = useRef<PublicKey | null>(null);
@@ -191,7 +192,6 @@ const App: React.FC = () => {
                     onChange={(e) => setInputText(e.target.value)}
                     onKeyDown={async (e) => {
                         if (e.key === 'Enter') {
-                            setAgentReply(null);
                             await doInteractionTx(inputText);
                         }
                     }}
@@ -201,11 +201,11 @@ const App: React.FC = () => {
             <div style={{textAlign: 'center', width: '40rem'}}>
                 <div className="response-text" style={{marginTop: '10px', textAlign: 'center'}}>
                     <Response loading={isLoading} message={agentReply?.[0]}
-                              onClose={() => setAgentReply(null)}></Response>
+                              onClose={clearAgentReply}></Response>
                 </div>
 
                 <div className="response-text" style={{marginTop: '10px', textAlign: 'center'}}>
-                    <Signature devnet={connection.rpcEndpoint.includes('devnet')} message={agentReply?.[2]} onClose={() => setAgentReply(null)}></Signature>                </div>
+                    <Signature devnet={connection.rpcEndpoint.includes('devnet')} message={agentReply?.[2]} onClose={clearAgentReply}></Signature>                </div>
             </div>
 
             {isSubmitting && (

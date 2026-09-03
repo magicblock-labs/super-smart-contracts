@@ -11,21 +11,22 @@ const Signature: React.FC<SignatureProps> = ({ devnet, message, onClose }) => {
 
     // Handle fade effect
     useEffect(() => {
+        if (!message) return;
         setOpacity(1);
 
         const fadeOutTimer = setTimeout(() => {
             setOpacity(0);
-        }, 7000);
+        }, 20000);
 
         const removeTimer = setTimeout(() => {
             onClose();
-        }, 7500);
+        }, 21000);
 
         return () => {
             clearTimeout(fadeOutTimer);
             clearTimeout(removeTimer);
         };
-    }, [onClose]);
+    }, [message, onClose]);
 
     return (
         <div style={{

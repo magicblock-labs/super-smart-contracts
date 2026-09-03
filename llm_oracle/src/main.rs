@@ -3,7 +3,7 @@ use anchor_lang::{AccountDeserialize, AnchorSerialize, Discriminator};
 use chatgpt::client::ChatGPT;
 use chatgpt::config::ModelConfiguration;
 use chatgpt::types::{ChatMessage, Role};
-use futures::StreamExt;
+use futures::{stream, StreamExt};
 use memory::InteractionMemory;
 use solana_account_decoder::UiAccountEncoding;
 use solana_client::pubsub_client::PubsubClient;
@@ -17,25 +17,34 @@ use solana_sdk::{
     signature::{Keypair, Signer},
     transaction::Transaction,
 };
+use std::collections::HashSet;
 use std::env;
 use std::error::Error;
 use std::str::FromStr;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 
 mod memory;
 
 const MAX_TX_RETRY_ATTEMPTS: u8 = 5;
 const MAX_API_RETRY_ATTEMPTS: u8 = 3;
+const MAX_CONCURRENT_INTERACTIONS: usize = 4;
 const OPENROUTER_API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_OPENROUTER_MODEL: &str = "openrouter/free";
+
+#[derive(Default)]
+struct ProcessingState {
+    in_flight: HashSet<Pubkey>,
+    parked: HashSet<Pubkey>,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let (rpc_url, websocket_url, openrouter_api_key, openrouter_model, payer, identity_pda) =
         load_config();
     let openrouter_model: &'static str = Box::leak(openrouter_model.into_boxed_str());
-    let mut interaction_memory = InteractionMemory::new(10);
+    let interaction_memory = Mutex::new(InteractionMemory::new(10));
+    let processing_state = Mutex::new(ProcessingState::default());
     println!(" Oracle identity: {:?}", payer.pubkey());
     println!(" RPC: {:?}", rpc_url.as_str());
     println!(" WS: {:?}", websocket_url.as_str());
@@ -48,7 +57,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             openrouter_model,
             &payer,
             &identity_pda,
-            &mut interaction_memory,
+            &interaction_memory,
+            &processing_state,
         )
         .await
         {
@@ -64,7 +74,8 @@ async fn run_oracle(
     openrouter_model: &'static str,
     payer: &Keypair,
     identity_pda: &Pubkey,
-    interaction_memory: &mut InteractionMemory,
+    interaction_memory: &Mutex<InteractionMemory>,
+    processing_state: &Mutex<ProcessingState>,
 ) -> Result<(), Box<dyn Error>> {
     let openrouter_client = ChatGPT::new_with_config(
         openrouter_api_key,
@@ -80,7 +91,6 @@ async fn run_oracle(
     let rpc_client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::processed());
 
     let (tx, rx) = mpsc::channel(100);
-    let mut stream = ReceiverStream::new(rx);
 
     let rpc_config = RpcAccountInfoConfig {
         commitment: Some(CommitmentConfig::processed()),
@@ -97,26 +107,16 @@ async fn run_oracle(
         ),
     )];
 
-    fetch_and_process_program_accounts(
-        &rpc_client,
-        filters.clone(),
-        payer,
-        identity_pda,
-        &openrouter_client,
-        interaction_memory,
-    )
-    .await?;
-
     let program_config = RpcProgramAccountsConfig {
         account_config: rpc_config,
-        filters: Some(filters),
+        filters: Some(filters.clone()),
         ..Default::default()
     };
 
     let subscription = PubsubClient::program_subscribe(
         &websocket_url,
         &solana_gpt_oracle::ID,
-        Some(program_config),
+        Some(program_config.clone()),
     )?;
 
     tokio::spawn(async move {
@@ -128,24 +128,75 @@ async fn run_oracle(
         }
     });
 
-    while let Some(update) = stream.next().await {
-        if let Ok(interaction_pubkey) = Pubkey::from_str(&update.value.pubkey) {
-            if let Some(data) = update.value.account.data.decode() {
-                process_interaction(
-                    payer,
-                    identity_pda,
-                    &openrouter_client,
-                    &rpc_client,
-                    interaction_pubkey,
-                    data,
-                    interaction_memory,
-                )
-                .await?;
-            }
+    let accounts =
+        rpc_client.get_program_accounts_with_config(&solana_gpt_oracle::ID, program_config)?;
+    let backlog = stream::iter(
+        accounts
+            .into_iter()
+            .map(|(pubkey, account)| (pubkey, account.data)),
+    );
+    let updates = ReceiverStream::new(rx).filter_map(|update| async move {
+        let interaction_pubkey = Pubkey::from_str(&update.value.pubkey).ok()?;
+        let data = update.value.account.data.decode()?;
+        Some((interaction_pubkey, data))
+    });
+
+    stream::select(backlog, updates)
+        .for_each_concurrent(MAX_CONCURRENT_INTERACTIONS, |(interaction_pubkey, data)| {
+            process_or_park(
+                payer,
+                identity_pda,
+                &openrouter_client,
+                &rpc_client,
+                interaction_pubkey,
+                data,
+                interaction_memory,
+                processing_state,
+            )
+        })
+        .await;
+
+    Ok(())
+}
+
+async fn process_or_park(
+    payer: &Keypair,
+    identity_pda: &Pubkey,
+    openrouter_client: &ChatGPT,
+    rpc_client: &RpcClient,
+    interaction_pubkey: Pubkey,
+    data: Vec<u8>,
+    interaction_memory: &Mutex<InteractionMemory>,
+    processing_state: &Mutex<ProcessingState>,
+) {
+    {
+        let mut state = processing_state.lock().await;
+        if state.parked.contains(&interaction_pubkey) || !state.in_flight.insert(interaction_pubkey)
+        {
+            return;
         }
     }
 
-    Ok(())
+    let result = process_interaction(
+        payer,
+        identity_pda,
+        openrouter_client,
+        rpc_client,
+        interaction_pubkey,
+        data,
+        interaction_memory,
+    )
+    .await;
+
+    let mut state = processing_state.lock().await;
+    state.in_flight.remove(&interaction_pubkey);
+    if let Err(error) = result {
+        state.parked.insert(interaction_pubkey);
+        eprintln!(
+            "Parking interaction {} until process restart: {:?}",
+            interaction_pubkey, error
+        );
+    }
 }
 
 /// Process an interaction and respond to it
@@ -156,7 +207,7 @@ async fn process_interaction(
     rpc_client: &RpcClient,
     interaction_pubkey: Pubkey,
     data: Vec<u8>,
-    interaction_memory: &mut InteractionMemory,
+    interaction_memory: &Mutex<InteractionMemory>,
 ) -> Result<(), Box<dyn Error>> {
     if let Ok(interaction) =
         solana_gpt_oracle::Interaction::try_deserialize_unchecked(&mut data.as_slice())
@@ -175,15 +226,13 @@ async fn process_interaction(
                 );
 
                 // Get a response from the OpenRouter API
-                let mut previous_history = interaction_memory
+                let mut memory = interaction_memory.lock().await;
+                let mut previous_history = memory
                     .get_history(&interaction_pubkey)
                     .unwrap_or(Vec::new())
                     .clone();
-                interaction_memory.add_interaction(
-                    interaction_pubkey,
-                    interaction.text.clone(),
-                    Role::User,
-                );
+                memory.add_interaction(interaction_pubkey, interaction.text.clone(), Role::User);
+                drop(memory);
                 previous_history.push(ChatMessage {
                     role: Role::User,
                     content: format!(
@@ -201,11 +250,6 @@ async fn process_interaction(
                         }
                         Err(e) => {
                             api_attempts += 1;
-                            previous_history = previous_history
-                                .iter()
-                                .skip((api_attempts * 2) as usize)
-                                .cloned()
-                                .collect();
                             eprintln!(
                                 "API call failed (attempt {}/{}): {:?}",
                                 api_attempts, MAX_API_RETRY_ATTEMPTS, e
@@ -217,7 +261,7 @@ async fn process_interaction(
                     }
                 }
 
-                interaction_memory.add_interaction(
+                interaction_memory.lock().await.add_interaction(
                     interaction_pubkey,
                     response_content.clone(),
                     Role::System,
@@ -255,6 +299,7 @@ async fn process_interaction(
                 // Send the response with the callback transaction
                 let mut attempts = 0;
                 while attempts < MAX_TX_RETRY_ATTEMPTS {
+                    attempts += 1;
                     if let Ok(recent_blockhash) = rpc_client
                         .get_latest_blockhash_with_commitment(CommitmentConfig::processed())
                     {
@@ -277,59 +322,23 @@ async fn process_interaction(
                         match rpc_client.send_and_confirm_transaction(&transaction) {
                             Ok(signature) => {
                                 println!("Transaction signature: {}\n", signature);
-                                break;
+                                return Ok(());
                             }
-                            Err(e) => {
-                                attempts += 1;
-                                eprintln!("Failed to send transaction: {:?}\n", e)
-                            }
+                            Err(e) => eprintln!("Failed to send transaction: {:?}\n", e),
                         }
                     }
                 }
+                return Err(std::io::Error::other(format!(
+                    "callback failed after {} attempts",
+                    MAX_TX_RETRY_ATTEMPTS
+                ))
+                .into());
             }
+            return Err(std::io::Error::other("invalid context account").into());
         }
+        return Err(std::io::Error::other("failed to fetch context account").into());
     }
-    Ok(())
-}
-
-/// Fetch all open interactions and process them
-async fn fetch_and_process_program_accounts(
-    rpc_client: &RpcClient,
-    filters: Vec<solana_client::rpc_filter::RpcFilterType>,
-    payer: &Keypair,
-    identity_pda: &Pubkey,
-    openrouter_client: &ChatGPT,
-    interaction_memory: &mut InteractionMemory,
-) -> Result<(), Box<dyn Error>> {
-    let rpc_config = RpcAccountInfoConfig {
-        commitment: Some(CommitmentConfig::processed()),
-        encoding: Some(UiAccountEncoding::Base64),
-        ..Default::default()
-    };
-
-    let program_config = RpcProgramAccountsConfig {
-        account_config: rpc_config,
-        filters: Some(filters),
-        ..Default::default()
-    };
-
-    let accounts =
-        rpc_client.get_program_accounts_with_config(&solana_gpt_oracle::ID, program_config)?;
-
-    for (pubkey, account) in accounts {
-        process_interaction(
-            payer,
-            identity_pda,
-            openrouter_client,
-            rpc_client,
-            pubkey,
-            account.data,
-            interaction_memory,
-        )
-        .await?;
-    }
-
-    Ok(())
+    Err(std::io::Error::other("invalid interaction account").into())
 }
 
 /// Load the Oracle configuration
